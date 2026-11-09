@@ -1,0 +1,10 @@
+.claude/
+CLAUDE.md
+.env*
+!.env.example
+*.log
+node_modules/
+.next/
+backend/.venv/
+__pycache__/
+*.pyc
