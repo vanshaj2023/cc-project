@@ -131,7 +131,7 @@ async def analyze(
         "image": analyze_image,
     }
     try:
-        return handlers[kind](data, selected, custom_terms)
+        return await run_in_threadpool(handlers[kind], data, selected, custom_terms)
     except HTTPException:
         raise
     except Exception:

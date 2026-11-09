@@ -183,16 +183,24 @@ class RedactionService:
         redacted, counts = apply_redactions(text, identifiers)
         return redacted, identifiers, counts
 
+    def identify_page(self, text: str) -> list[Identifier]:
+        model = os.environ.get("REDACTION_MODEL")
+        if not model:
+            raise DocumentProcessingError("REDACTION_MODEL is not set.")
+        if count_real_words(text) == 0:
+            return []
+        return self._find_identifiers(text, model)
+
     def _find_identifiers(self, text: str, model: str) -> list[Identifier]:
         for _attempt in range(MAX_ATTEMPTS):
-            reply = self._complete(build_prompt(text), model)
+            reply = self.complete(build_prompt(text), model)
             try:
                 return parse_identifiers(reply)
             except ValueError:
                 continue
         raise DocumentNeedsReviewError("The model reply could not be parsed.")
 
-    def _complete(self, prompt: str, model: str) -> str:
+    def complete(self, content: Any, model: str) -> str:
         completion = self._completion_fn
         if completion is None:
             from litellm import completion
@@ -200,14 +208,14 @@ class RedactionService:
         try:
             response = completion(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": content}],
                 temperature=0,
                 max_tokens=MAX_TOKENS,
                 reasoning_effort=os.environ.get("REDACTION_REASONING_EFFORT", "low"),
                 drop_params=True,
             )
         except Exception as error:
-            raise DocumentProcessingError("The redaction model call failed.") from error
+            raise DocumentProcessingError(f"The redaction model call failed ({type(error).__name__}).") from error
 
         usage = getattr(response, "usage", None)
         self._tokens += int(getattr(usage, "total_tokens", 0) or 0)

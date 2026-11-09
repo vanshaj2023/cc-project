@@ -231,6 +231,7 @@ export default function Home() {
           onReset={handleReset}
         />
         {error && <p className="text-sm text-danger">{error}</p>}
+        {analysis.warning && <p className="text-sm text-muted">{analysis.warning}</p>}
       </div>
     </main>
   );

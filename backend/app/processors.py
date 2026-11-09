@@ -1,8 +1,10 @@
 import base64
 import io
+import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 import fitz
 import numpy as np
@@ -11,10 +13,21 @@ from PIL import Image, ImageDraw
 from rapidocr_onnxruntime import RapidOCR
 
 from .patterns import find_matches
+from .redaction_service import (
+    DocumentNeedsReviewError,
+    DocumentProcessingError,
+    Identifier,
+    RedactionService,
+)
+from .vision_detection import AiHit, Box, find_image_identifiers
 
 PDF_PREVIEW_ZOOM = 1.6
 MAX_PDF_PAGES = 60
 BLOCK_CHAR = "█"
+OCR_MIN_SIDE = 1600
+AI_PAGE_WORKERS = 4
+DUPLICATE_OVERLAP = 0.6
+AI_ERRORS = (DocumentProcessingError, DocumentNeedsReviewError)
 
 _ocr_engine: Optional[RapidOCR] = None
 
@@ -60,16 +73,90 @@ def _png_data_url(image_bytes: bytes) -> str:
 
 
 def _ocr_lines(image: Image.Image) -> list[tuple[list[list[float]], str]]:
-    result, _ = _ocr()(np.array(image.convert("RGB")))
-    return [(box, text) for box, text, _score in (result or [])]
+    rgb = image.convert("RGB")
+    scale = max(1.0, OCR_MIN_SIDE / max(rgb.size))
+    if scale > 1.0:
+        rgb = rgb.resize((round(rgb.width * scale), round(rgb.height * scale)), Image.LANCZOS)
+    result, _ = _ocr()(np.array(rgb))
+    return [([[x / scale, y / scale] for x, y in box], text) for box, text, _score in (result or [])]
+
+
+def _ai_enabled() -> bool:
+    return bool(os.environ.get("REDACTION_MODEL"))
+
+
+def _is_duplicate(box: Box, page: int, existing: list["Detection"]) -> bool:
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    for other in existing:
+        if other.page != page or other.box is None:
+            continue
+        width = min(box[2], other.box[2]) - max(box[0], other.box[0])
+        height = min(box[3], other.box[3]) - max(box[1], other.box[1])
+        if width <= 0 or height <= 0:
+            continue
+        other_area = (other.box[2] - other.box[0]) * (other.box[3] - other.box[1])
+        if width * height / min(area, other_area) > DUPLICATE_OVERLAP:
+            return True
+    return False
+
+
+def _hits_to_detections(
+    hits: list[AiHit], page_index: int, existing: list["Detection"], warnings: list[str]
+) -> list["Detection"]:
+    detections: list[Detection] = []
+    unlocated = 0
+    for hit in hits:
+        if not hit.boxes:
+            unlocated += 1
+            continue
+        for box in hit.boxes:
+            if _is_duplicate(box, page_index, existing + detections):
+                continue
+            detections.append(Detection(page=page_index, text=hit.text, category=hit.category.lower(), box=box))
+    if unlocated:
+        warnings.append(f"{unlocated} AI-detected item(s) could not be located. Draw boxes over them.")
+    return detections
+
+
+def _locate_text_identifiers(
+    pdf_page: fitz.Page,
+    page_index: int,
+    identifiers: list[Identifier],
+    existing: list["Detection"],
+    warnings: list[str],
+) -> list["Detection"]:
+    page_width, page_height = pdf_page.rect.width, pdf_page.rect.height
+    unique: dict[str, str] = {}
+    for identifier in identifiers:
+        unique.setdefault(identifier.text, identifier.category)
+
+    detections: list[Detection] = []
+    missed = 0
+    for text, category in unique.items():
+        rects = pdf_page.search_for(text)
+        if not rects:
+            missed += 1
+            continue
+        for rect in rects:
+            box = (rect.x0 / page_width, rect.y0 / page_height, rect.x1 / page_width, rect.y1 / page_height)
+            if _is_duplicate(box, page_index, existing + detections):
+                continue
+            detections.append(Detection(page=page_index, text=text, category=category.lower(), box=box))
+    if missed:
+        warnings.append(f"{missed} AI-detected item(s) could not be located. Draw boxes over them.")
+    return detections
 
 
 def _detect_from_ocr(
-    image: Image.Image, page_index: int, categories: set[str], keywords: list[str]
+    image: Image.Image,
+    page_index: int,
+    categories: set[str],
+    keywords: list[str],
+    lines: list[tuple[list[list[float]], str]],
 ) -> list[Detection]:
     width, height = image.size
     detections: list[Detection] = []
-    for points, text in _ocr_lines(image):
+    for points, text in lines:
         xs = [point[0] for point in points]
         ys = [point[1] for point in points]
         left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
@@ -97,24 +184,76 @@ def analyze_image(data: bytes, categories: set[str], keywords: list[str]) -> dic
     buffer = io.BytesIO()
     rgb.save(buffer, format="PNG")
     page = Page(0, rgb.width, rgb.height, _png_data_url(buffer.getvalue()))
-    detections = _detect_from_ocr(rgb, 0, categories, keywords)
-    return _payload("image", [page], detections)
+    lines = _ocr_lines(rgb)
+    detections = _detect_from_ocr(rgb, 0, categories, keywords, lines)
+    warnings: list[str] = []
+    if _ai_enabled():
+        try:
+            hits = find_image_identifiers(rgb, lines)
+        except AI_ERRORS as error:
+            warnings.append(f"AI detection failed: {error}")
+        else:
+            detections.extend(_hits_to_detections(hits, 0, detections, warnings))
+    return _payload("image", [page], detections, warnings)
+
+
+@dataclass
+class _AiJob:
+    index: int
+    text: str
+    image: Optional[Image.Image] = None
+    lines: Optional[list[tuple[list[list[float]], str]]] = None
 
 
 def analyze_pdf(data: bytes, categories: set[str], keywords: list[str]) -> dict[str, object]:
     document = fitz.open(stream=data, filetype="pdf")
     pages: list[Page] = []
     detections: list[Detection] = []
+    jobs: list[_AiJob] = []
     matrix = fitz.Matrix(PDF_PREVIEW_ZOOM, PDF_PREVIEW_ZOOM)
 
     for index in range(min(document.page_count, MAX_PDF_PAGES)):
         pdf_page = document[index]
         pixmap = pdf_page.get_pixmap(matrix=matrix, alpha=False)
         pages.append(Page(index, pixmap.width, pixmap.height, _png_data_url(pixmap.tobytes("png"))))
-        detections.extend(_detect_pdf_page(pdf_page, pixmap, index, categories, keywords))
+        page_detections, job = _detect_pdf_page(pdf_page, pixmap, index, categories, keywords)
+        detections.extend(page_detections)
+        jobs.append(job)
 
+    warnings: list[str] = []
+    if _ai_enabled():
+        detections.extend(_run_pdf_ai(document, jobs, detections, warnings))
     document.close()
-    return _payload("pdf", pages, detections)
+    return _payload("pdf", pages, detections, warnings)
+
+
+def _run_pdf_ai(
+    document: fitz.Document, jobs: list[_AiJob], existing: list[Detection], warnings: list[str]
+) -> list[Detection]:
+    service = RedactionService()
+
+    def work(job: _AiJob) -> Union[list[AiHit], list[Identifier], Exception]:
+        try:
+            if job.image is not None:
+                return find_image_identifiers(job.image, job.lines or [])
+            return service.identify_page(job.text)
+        except AI_ERRORS as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=AI_PAGE_WORKERS) as pool:
+        results = list(pool.map(work, jobs))
+
+    found: list[Detection] = []
+    for job, result in zip(jobs, results):
+        if isinstance(result, Exception):
+            warnings.append(f"AI detection failed on page {job.index + 1}: {result}")
+        elif job.image is not None:
+            found.extend(_hits_to_detections(result, job.index, existing + found, warnings))
+        else:
+            found.extend(
+                _locate_text_identifiers(document[job.index], job.index, result, existing + found, warnings)
+            )
+    return found
 
 
 def _detect_pdf_page(
@@ -123,11 +262,12 @@ def _detect_pdf_page(
     index: int,
     categories: set[str],
     keywords: list[str],
-) -> list[Detection]:
+) -> tuple[list[Detection], _AiJob]:
     text = pdf_page.get_text("text")
     if not text.strip():
         image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-        return _detect_from_ocr(image, index, categories, keywords)
+        lines = _ocr_lines(image)
+        return _detect_from_ocr(image, index, categories, keywords, lines), _AiJob(index, "", image, lines)
 
     page_width, page_height = pdf_page.rect.width, pdf_page.rect.height
     detections: list[Detection] = []
@@ -151,7 +291,7 @@ def _detect_pdf_page(
                     ),
                 )
             )
-    return detections
+    return detections, _AiJob(index, text)
 
 
 def _docx_paragraphs(document: Document) -> list:
@@ -183,17 +323,35 @@ def analyze_docx(data: bytes, categories: set[str], keywords: list[str]) -> dict
             seen.add(match.text)
             detections.append(Detection(page=0, text=match.text, category=match.category))
 
-    payload = _payload("docx", [], detections)
+    warnings: list[str] = []
+    if _ai_enabled():
+        try:
+            identifiers = RedactionService().identify_page("\n".join(preview))
+        except AI_ERRORS as error:
+            warnings.append(f"AI detection failed: {error}")
+        else:
+            for identifier in identifiers:
+                if identifier.text in seen:
+                    continue
+                seen.add(identifier.text)
+                detections.append(Detection(page=0, text=identifier.text, category=identifier.category.lower()))
+
+    payload = _payload("docx", [], detections, warnings)
     payload["paragraphs"] = preview
     return payload
 
 
-def _payload(kind: str, pages: list[Page], detections: list[Detection]) -> dict[str, object]:
-    return {
+def _payload(
+    kind: str, pages: list[Page], detections: list[Detection], warnings: Optional[list[str]] = None
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "kind": kind,
         "pages": [page.as_dict() for page in pages],
         "detections": [detection.as_dict() for detection in detections],
     }
+    if warnings:
+        payload["warning"] = " ".join(dict.fromkeys(warnings))
+    return payload
 
 
 def redact_image(data: bytes, boxes: list[dict[str, float]]) -> tuple[bytes, str, str]:
